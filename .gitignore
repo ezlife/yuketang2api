@@ -1,5 +1,11 @@
 # 逆向中间产物(雨课堂前端原始 JS,有版权,不入库)
 chunks/
+aiworkspace*.js
+vendor*.js
+vendors*.js
+app_*.js
+manifest*.js
+styles*.js
 *.js.bak
 chunk_urls*.txt
 chunks.txt
