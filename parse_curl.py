@@ -14,10 +14,11 @@ import shlex
 
 def parse(curl: str):
     out = {}
-    # cookie 头
+    # cookie 头(-H 'cookie:' / --cookie / -b 三种形式,DevTools 复制常见 -b)
     m = re.search(r"-H\s+[\"']cookie:\s*([^\"']+)[\"']", curl, re.I) or \
         re.search(r"--cookie\s+[\"']([^\"']+)[\"']", curl, re.I) or \
-        re.search(r"\$cookie\s+[\"']([^\"']+)[\"']", curl, re.I)
+        re.search(r"(?:-b|--cookie)\s+'([^']+)'", curl) or \
+        re.search(r"(?:-b|--cookie)\s+\"([^\"]+)\"", curl)
     if m:
         ck = m.group(1).strip()
         keep = []
@@ -29,24 +30,33 @@ def parse(curl: str):
     # csrf 头
     m = re.search(r"-H\s+[\"']x-csrftoken:\s*([^\"']+)[\"']", curl, re.I)
     if m and "csrftoken=" + m.group(1).strip() not in out.get("YKT_SESSION", ""):
-        out["YKT_SESSION"] = out.get("YKT_SESSION", "") + "; csrftoken=" + m.group(1).strip()
+        out["YKT_SESSION"] = (out.get("YKT_SESSION", "") + "; csrftoken=" + m.group(1).strip()).strip("; ")
     # university-id
     m = re.search(r"-H\s+[\"'](?:university-id|uv-id):\s*([^\"']+)[\"']", curl, re.I)
     if m:
         out["YKT_UV_ID"] = m.group(1).strip()
-    # URL 与 query
-    m = re.search(r"(?:curl(?:\s+\S+)*?\s+'|curl(?:\s+\S+)*?\s+)(https?://[^'\s]+)", curl)
+    # URL 与 query(--url 或裸 URL 均匹配)
+    m = re.search(r"(?:--url\s+|curl(?:\s+--?\S+)*?\s+)['\"]?(https?://[^'\"\s]+)", curl)
     url = m.group(1) if m else ""
     out["_url"] = url
-    q = dict(re.findall(r"([a-zA-Z_]+)=([^&'\s]+)", url.split("?", 1)[1] if "?" in url else ""))
-    if q.get("agent_id"):
-        out["YKT_AGENT_ID"] = q["agent_id"]
-    if q.get("agentId"):
-        out["YKT_AGENT_ID"] = q["agentId"]
-    if q.get("classroom_id"):
-        out["YKT_CLASSROOM_ID"] = q["classroom_id"]
-    if q.get("classroomId"):
-        out["YKT_CLASSROOM_ID"] = q["classroomId"]
+    qs = url.split("?", 1)[1] if "?" in url else ""
+    q = dict(re.findall(r"([a-zA-Z_]+)=([^&'\s]+)", qs))
+    for qk, ek in (("agent_id", "YKT_AGENT_ID"), ("agentId", "YKT_AGENT_ID"),
+                   ("classroom_id", "YKT_CLASSROOM_ID"), ("classroomId", "YKT_CLASSROOM_ID"),
+                   ("entity_id", "YKT_ENTITY_ID"), ("entity_type", "YKT_ENTITY_TYPE"),
+                   ("capability_id", "YKT_CAPABILITY_ID")):
+        if q.get(qk):
+            out[ek] = q[qk]
+    # referer 里的 agentId/classroomId 兜底
+    m = re.search(r"referer:\s*[^'\"]*[?&]agentId=(\d+)", curl, re.I)
+    if m and "YKT_AGENT_ID" not in out:
+        out["YKT_AGENT_ID"] = m.group(1)
+    m = re.search(r"referer:\s*[^'\"]*[?&]classroomId=(\d+)", curl, re.I)
+    if m and "YKT_CLASSROOM_ID" not in out:
+        out["YKT_CLASSROOM_ID"] = m.group(1)
+    m = re.search(r"referer:\s*[^'\"]*[?&]entity_type=(\d+)", curl, re.I)
+    if m and "YKT_ENTITY_TYPE" not in out:
+        out["YKT_ENTITY_TYPE"] = m.group(1)
     # body
     m = re.search(r"--data-raw\s+'([^']*)'", curl) or re.search(r"-d\s+'([^']*)'", curl)
     if m:
@@ -65,14 +75,15 @@ def main():
         curl = sys.stdin.read()
     r = parse(curl)
     print("\n# ===== 复制到终端 export =====")
-    for k in ("YKT_SESSION", "YKT_UV_ID", "YKT_AGENT_ID", "YKT_CLASSROOM_ID"):
+    for k in ("YKT_SESSION", "YKT_UV_ID", "YKT_AGENT_ID", "YKT_CLASSROOM_ID",
+              "YKT_ENTITY_ID", "YKT_ENTITY_TYPE", "YKT_CAPABILITY_ID"):
         if k in r:
             print(f"export {k}='{r[k]}'")
     print("\n# 请求明细(核对用)")
     print("URL:", r.get("_url", "?"))
     print("body:", json.dumps(r.get("_body", ""), ensure_ascii=False))
     if not r.get("YKT_SESSION"):
-        print("\n[!] 没解出 Cookie:确认拷的是 changjie.yuketang.cn 的请求(不是静态资源/别的域)")
+        print("\n[!] 没解出 Cookie:确认拷的是 www.yuketang.cn 的请求(不是静态资源/别的域)")
 
 
 if __name__ == "__main__":

@@ -1,103 +1,119 @@
-# 雨课堂 24H AI 智能学伴 → API(逆向)
+# yuketang2api — 雨课堂 24H AI 智能学伴 → API
 
-逆向对象:`changjie.yuketang.cn` Web 前端
-(frontend `fe-static/web/1.2.354`,模块 94192=HTTP/SSE 封装、8181=聊天 SDK、66542=useChat hook)。
+把雨课堂的「24H AI 智能学伴」逆向成 OpenAI 兼容 API。
+**已在真实登录态下完整验证打通**(2026-11,流式、多轮、usage 均正常,底层模型 `智谱GLM-4-Plus`)。
 
-## 一、逆向结论(协议)
+## 协议(逆向 + 实测验证)
+
+入口域:**`www.yuketang.cn`**(chatbot iframe 同源)。认证:Django session(`sessionid`+`csrftoken` cookie,HttpOnly 只能从 Network 请求头抓)。
 
 ### 发消息(核心,流式)
 
 ```
-POST https://changjie.yuketang.cn/api/v3/ai/online-courseware/capability-conversation/send-message-stream
-Content-Type: application/json
-Cookie: sessionid=...; csrftoken=...
-X-CSRFToken: <csrftoken 值>
-xtbz: ykt
-Xt-Agent: web
-university-id: <uv_id,可为 0>
+POST https://www.yuketang.cn/api/v3/ai/online-courseware/capability-conversation/send-message-stream?classroom_id=..&agent_id=..
+Cookie: sessionid=...; csrftoken=...      X-CSRFToken: <csrftoken>
+xtbz: ykt   Xt-Agent: web   university-id: <uv_id>
 
-{"messageInfo":"你的问题","conversationId":123456}
+{
+  "messageInfo": {                 ← 对象!传字符串服务端直接 500
+    "templateId": 0, "source": 0,
+    "content": "你的问题",
+    "agentId": 27537, "type": "str", "files": [], "lessonId": ""
+  },
+  "conversationId": 30210152
+}
 ```
 
-- 响应**不是标准 SSE**,是 `}\n{` 拼接的 JSON 增量流,逐片解析
-- 每片 JSON 字段:
-  - `content`:正文增量(string)
-  - `reasoning_content`:思考链增量
-  - `type == "heartbeat"`:心跳,跳过
-  - `send_id` / `reply_id`:问答消息 id(第一条带)
-  - `end_reason >= 0`:结束(敏感词/出错也在这)
-  - `recommend_questions`、`rag_documents`、`additional`、`node_info`
-- 前端源码里就是拿 XHR `onDownloadProgress` 的 `responseText` 增量按 `}\n{` 切分
+响应 `application/octet-stream`,每行一个 JSON(`}\n{` 拼接):
 
-### 会话与周边接口
+```
+{"reply_id":133980404,"send_id":133980403}     ← 首片:消息 id
+{"content":"","additional":{}}
+{"content":"你好","provider":null}               ← 正文增量流
+{"content":"我是","provider":null}
+{"content":"","rag_documents":[...],"provider":"zhipu"}   ← 引用课程文档
+{"content":"","usage":{"prompt_tokens":7839,...},"model":"智谱GLM-4-Plus"}
+{"content":"","rag_documents":[...],"end_reason":0}       ← 结束
+```
+
+注意:`content` 里混有**零宽字符水印**(U+200B-200D/U+FEFF,反爬),要 strip。
+
+### 配套接口
 
 | 功能 | 请求 |
 |---|---|
-| 查会话 | `GET /c27/online_courseware/capability-conversation/?agent_id=..&classroom_id=..&source_id=0` |
+| 查会话 | `GET /c27/online_courseware/capability-conversation/?capability_id=..&entity_id=..&entity_type=25&classroom_id=..&source_id=0&agent_id=..` → `data.results[]` |
 | 建会话 | `POST /c27/online_courseware/capability-conversation/`(同参数 JSON body) |
 | 历史 | `GET /c27/online_courseware/capability-conversation/{id}/talk_records/?page_size=20` |
 | 停止生成 | `POST /c27/online_courseware/capability-conversation/reply_stop/` |
-| 清空历史 | `POST /c27/online_courseware/capability-conversation/{id}/clear/` |
-| Agent能力 | `GET /c27/online_courseware/ykt/agent/{agentId}/capability/?category=1` |
+| 清空 | `POST /c27/online_courseware/capability-conversation/{id}/clear/` |
 
-### 认证
+24H 学伴:`entity_type=25`,`entity_id` = classroom_id。
 
-Django session:`sessionid` + `csrftoken` 两个 cookie,POST 带 `X-CSRFToken` 头。无独立 token。
-辅助头:`xtbz: ykt`、`Xt-Agent: web`、`university-id`。
+## 使用
 
-### 入口链路(为什么这样设计)
+### 1. 抓参数(30 秒)
 
-课程页"24小时智能学伴"图标 → 同站 iframe
-`/ai-workspace/chatbot-window?agentId=..&category=1&classroomId=..`(iframe URL 里就有 agentId)
-→ iframe 内 `useChat` hook:GET/POST 建会话 → SSE 发消息。
+`sessionid` 是 HttpOnly,控制台 JS 读不到——从 Network 抓:
 
-## 二、怎么用(三步)
-
-### 1. 拿 Cookie 和 agentId
-
-浏览器登录雨课堂 → 打开一个带 24H 学伴的课程 → F12 控制台粘贴运行
-[grab_snippet.js](grab_snippet.js) 的内容,会直接打出:
-
-```
-export YKT_SESSION='sessionid=xxx; csrftoken=yyy'
-export YKT_UV_ID='0'
-export YKT_AGENT_ID='123456'
-export YKT_CLASSROOM_ID='789'
-```
-
-> 手工方式:F12 → Application → Cookies → `changjie.yuketang.cn` 拷 `sessionid`/`csrftoken`;
-> Network 过滤 `send-message-stream` 或看 chatbot iframe 的 URL 参数拿 `agentId`。
-
-### 2. 命令行直聊
+1. 登录雨课堂,进有 24H 学伴的课程,打开学伴问一句
+2. `F12` → **Network** → 过滤 `capability-conversation`
+3. 右键任一请求(推荐 GET 那条)→ **Copy → Copy as cURL**
+4. 粘贴运行解析器,自动产出全部环境变量:
 
 ```bash
-cd ~/yuketang-research
-export YKT_SESSION='...' YKT_AGENT_ID='...'
-python3 ykt24h.py chat "用一句话解释傅里叶变换"
-python3 ykt24h.py repl      # 多轮(同会话自动带上下文)
+python3 parse_curl.py <(pbpaste)   # 或粘到文件/交互粘贴
 ```
 
-### 3. 变成 OpenAI 兼容 API(to api)
+得到(示例值):
+
+```bash
+export YKT_SESSION='sessionid=xxx; csrftoken=yyy'
+export YKT_UV_ID='2614'
+export YKT_AGENT_ID='27537'
+export YKT_CLASSROOM_ID='33073653'
+export YKT_ENTITY_ID='33073653'
+export YKT_ENTITY_TYPE='25'
+export YKT_CAPABILITY_ID='418409'
+```
+
+### 2. 命令行直聊(实测输出)
+
+```bash
+python3 ykt24h.py chat "一句话:什么是雨课堂?"
+# 雨课堂是一种基于移动互联网的教学工具,它能够帮助教师实现课前预习、课堂互动和课后反馈的全流程教学管理。
+# [end_reason=0 model=智谱GLM-4-Plus usage={'prompt_tokens': 4118, ...}]
+
+python3 ykt24h.py repl      # 多轮(同会话自动带上下文),/new 开新会话
+```
+
+### 3. OpenAI 兼容 API
 
 ```bash
 python3 ykt24h_server.py 8317
 ```
 
-然后任意 OpenAI 客户端接入:
+任何 OpenAI 客户端(Cherry Studio / one-api / openai sdk):
 
 ```bash
 curl http://127.0.0.1:8317/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"yuketang-24h","messages":[{"role":"user","content":"你好"}],"stream":true}'
+  -d '{"model":"yuketang-24h","stream":true,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
-- Cherry Studio / one-api / new-api:API 地址填 `http://127.0.0.1:8317/v1`,Key 任意,模型名 `yuketang-24h`
-- 支持流式 `stream:true` 和非流式;`reasoning_content` 字段兼容思维链展示
-- 上下文在雨课堂会话侧维护:同一个 OpenAI 客户端对话发 `X-Conv-Key` 头区分不同会话,默认共用一个
+- `stream:true` 流式;`reasoning_content` 兼容思维链展示
+- 多轮上下文在雨课堂会话侧;用 `X-Conv-Key` 请求头隔离不同对话
+- `YKT_BASE` 环境变量可换域(默认 `https://www.yuketang.cn`)
 
-## 三、注意事项
+## 文件
 
-- `sessionid` 过期后脚本会提示重新拷;敏感词会以 `end_reason` 返回,正文被替换
-- 频率别拉满,雨课堂侧有会话审计(教师端能看到 24H 学伴问答记录)
-- `long_task: true` 走长任务模式(报告/文档生成类)
-- 复现文件:`chunks/` 是逆向用的原始 JS,`ykt24h.py` 是客户端,`ykt24h_server.py` 是兼容层
+- `ykt24h.py` — 核心客户端(会话管理 + 流式解析 + CLI)
+- `ykt24h_server.py` — OpenAI 兼容服务(标准库实现,零依赖)
+- `parse_curl.py` — DevTools "Copy as cURL" → 环境变量
+- `grab_snippet.js` — 浏览器控制台辅助(读不到 HttpOnly cookie,仅参考)
+
+## 注意
+
+- `sessionid` 过期脚本会提示重抓;教师端可见 24H 学伴问答审计,频率悠着点
+- `long_task:true` 走长任务模式(报告生成类)
+- 免责:仅供个人学习研究

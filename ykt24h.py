@@ -2,26 +2,35 @@
 # -*- coding: utf-8 -*-
 """
 雨课堂 24H AI 智能学伴 → API 客户端
-逆向自 changjie.yuketang.cn 前端 (fe-static web/1.2.354, module 94192/8181/66542)
+逆向自 www.yuketang.cn 前端 (fe-static web/1.2.354, module 94192/8181/66542)
+已在真实登录态下验证打通(HTTP 200,流式正常,底层模型 智谱GLM-4-Plus)。
 
-协议要点:
-  发消息(流式): POST /api/v3/ai/online-courseware/capability-conversation/send-message-stream
-      body: {"messageInfo": "<文本>", "conversationId": <id>, "long_task": true?}
-      响应: 流式 JSON 增量( }\n{ 分隔,非标准 SSE ),字段:
-        content / reasoning_content / type(heartbeat 跳过) / send_id / reply_id
-        end_reason(>=0 结束) / recommend_questions / rag_documents
-  查会话:   GET  /c27/online_courseware/capability-conversation/?agent_id=..&classroom_id=..
-  建会话:   POST /c27/online_courseware/capability-conversation/
+协议要点(实测验证):
+  发消息(流式): POST /api/v3/ai/online-courseware/capability-conversation/send-message-stream?classroom_id=..&agent_id=..
+      body: {"messageInfo":{            ← 注意是对象,不是字符串!
+               "templateId":0,"source":0,"content":"<文本>",
+               "agentId":<id>,"type":"str","files":[],"lessonId":""},
+             "conversationId":<id>}
+      响应: application/octet-stream, 每行一个 JSON(}\n{ 拼接),字段:
+        {reply_id, send_id} → {"content":"增量"} 连续流 → rag_documents
+        → usage/model("智谱GLM-4-Plus") → {"end_reason":0} 结束
+        content 里可能混零宽字符(\u200B-\u200D\uFEFF,反爬水印,需 strip)
+  查会话:   GET  /c27/online_courseware/capability-conversation/?capability_id=..&entity_id=..&entity_type=25&classroom_id=..&source_id=0&agent_id=..
+             → data.results[] (按 last_talk_time 倒序,取[0]或新建)
+  建会话:   POST /c27/online_courseware/capability-conversation/ (同参数 JSON body)
   历史:     GET  /c27/online_courseware/capability-conversation/{id}/talk_records/
   停止生成: POST /c27/online_courseware/capability-conversation/reply_stop/
   清空:     POST /c27/online_courseware/capability-conversation/{id}/clear/
   Agent能力: GET /c27/online_courseware/ykt/agent/{agentId}/capability/?category=1
   认证:     Cookie sessionid + csrftoken(Django);POST 需 X-CSRFToken 头
              xtbz: ykt / Xt-Agent: web / university-id: <uv_id>
+  24H 学伴 entity_type = 25
 
 用法:
   export YKT_SESSION="sessionid=xxx; csrftoken=yyy"    # 从浏览器拷
-  export YKT_AGENT_ID=123456                           # 24H 学伴的 agentId(见 README)
+  export YKT_AGENT_ID=27537
+  export YKT_ENTITY_ID=33073653 YKT_ENTITY_TYPE=25 YKT_CAPABILITY_ID=418409
+  export YKT_CLASSROOM_ID=33073653 YKT_UV_ID=2614
   python3 ykt24h.py chat "你好"
   python3 ykt24h.py repl
 """
@@ -32,7 +41,7 @@ import sys
 import time
 import requests
 
-BASE = "https://changjie.yuketang.cn"
+BASE = os.environ.get("YKT_BASE", "https://www.yuketang.cn").rstrip("/")
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -47,9 +56,12 @@ class Yuketang24H:
         self.uv_id = _env("YKT_UV_ID", str(uv_id))
         self.agent_id = int(_env("YKT_AGENT_ID", str(agent_id)) or 0)
         self.classroom_id = int(_env("YKT_CLASSROOM_ID", str(classroom_id)) or 0)
+        self.entity_id = _env("YKT_ENTITY_ID")
+        self.entity_type = _env("YKT_ENTITY_TYPE", "25")
+        self.capability_id = _env("YKT_CAPABILITY_ID")
         if not self.cookie:
             raise SystemExit("缺 Cookie: 先 export YKT_SESSION='sessionid=...; csrftoken=...'"
-                             "(浏览器 F12 → Application → Cookies → changjie.yuketang.cn)")
+                             "(浏览器 F12 → Network → 任意请求 → 请求头 Cookie)")
         m = re.search(r"csrftoken=([^;]+)", self.cookie)
         self.csrftoken = m.group(1) if m else ""
         self.s = requests.Session()
@@ -93,23 +105,25 @@ class Yuketang24H:
     def get_or_create_conversation(self, agent_id=None, classroom_id=None):
         aid = agent_id if agent_id is not None else self.agent_id
         cid = classroom_id if classroom_id is not None else self.classroom_id
-        q = {"capability_id": "", "entity_id": "", "entity_type": "",
-             "workflow_id": "", "classroom_id": cid, "source_id": 0,
-             "agent_id": aid, "lesson_id": "", "entity_ids": "",
-             "student_id": "", "source_ids": ""}
+        q = {"capability_id": self.capability_id or "",
+             "entity_id": self.entity_id, "entity_type": self.entity_type,
+             "classroom_id": cid, "source_id": 0, "agent_id": aid,
+             "lesson_id": "", "entity_ids": "", "student_id": "", "source_ids": ""}
         data = self.get_json("/c27/online_courseware/capability-conversation/", q)
-        # success 时 data: [{id,...}] 或直接对象
         conv = None
-        if isinstance(data, dict) and data.get("success"):
-            conv = data.get("data")
-        if isinstance(conv, list):
-            conv = conv[0] if conv else None
+        if isinstance(data, dict):
+            d = data.get("data")
+            if isinstance(d, dict):
+                results = d.get("results")
+                conv = results[0] if results else None
+            elif isinstance(d, list):
+                conv = d[0] if d else None
         if not conv:
             body = dict(q, agent_id=aid, classroom_id=cid, source_id=0)
             data = self.post_json("/c27/online_courseware/capability-conversation/", body)
             conv = data.get("data") if isinstance(data, dict) else None
-            if isinstance(conv, list):
-                conv = conv[0] if conv else None
+            if isinstance(conv, dict) and conv.get("results"):
+                conv = conv["results"][0]
         if not conv:
             raise RuntimeError(f"拿不到会话: {json.dumps(data, ensure_ascii=False)[:300]}")
         self.conversation_id = conv["id"]
@@ -131,7 +145,11 @@ class Yuketang24H:
         cid = conversation_id or self.conversation_id
         if not cid:
             cid = self.get_or_create_conversation()
-        body = {"messageInfo": message, "conversationId": cid}
+        # messageInfo 是对象(字符串形式会被服务端 500)
+        message_info = {"templateId": 0, "source": 0, "content": message,
+                        "agentId": self.agent_id, "type": "str",
+                        "files": [], "lessonId": ""}
+        body = {"messageInfo": message_info, "conversationId": cid}
         if long_task:
             body["long_task"] = True
         h = {"Content-Type": "application/json", "X-CSRFToken": self.csrftoken,
@@ -147,9 +165,11 @@ class Yuketang24H:
         # 与前端一致: 增量解析 "}\n{" 分隔的 JSON 流
         buf = ""
         decoder = _JsonStreamDecoder()
-        for chunk in r.iter_content(chunk_size=None, decode_unicode=True):
+        for chunk in r.iter_content(chunk_size=None):
             if not chunk:
                 continue
+            if isinstance(chunk, bytes):
+                chunk = chunk.decode("utf-8", errors="replace")
             buf += chunk
             for obj in decoder.feed(buf):
                 buf = ""
@@ -189,6 +209,10 @@ class Yuketang24H:
                 ev["recommend_questions"] = w["recommend_questions"]
             if w.get("rag_documents"):
                 ev["rag_documents"] = w["rag_documents"]
+            if w.get("usage"):
+                ev["usage"] = w["usage"]
+            if w.get("model"):
+                ev["model"] = w["model"]
             yield ev
 
     def stop(self, conversation_id, send_id, reply_id, content, ds="text"):
@@ -280,7 +304,9 @@ def _cli():
                     full.append(ev["content"])
                     print(ev["content"], end="", flush=True)
                 if ev.get("done") and ev.get("end_reason") is not None:
-                    print(f"\n[end_reason={ev['end_reason']}]")
+                    print(f"\n[end_reason={ev['end_reason']}"
+                          f" model={ev.get('model','?')}"
+                          f" usage={ev.get('usage',{})}]")
                     if ev.get("recommend_questions"):
                         print("推荐问题:", ev["recommend_questions"])
         print()
