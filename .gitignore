@@ -1,0 +1,11 @@
+# 逆向中间产物(雨课堂前端原始 JS,有版权,不入库)
+chunks/
+*.js.bak
+chunk_urls*.txt
+chunks.txt
+sendmsg-def.txt
+*.html
+index.html
+__pycache__/
+*.pyc
+.DS_Store
